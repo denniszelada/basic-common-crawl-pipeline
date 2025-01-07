@@ -21,3 +21,4 @@ tokio = { version = "1.39.2", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 warc = "0.3.2"
+minio = "0.1.0"
