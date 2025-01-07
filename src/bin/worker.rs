@@ -17,12 +17,57 @@ use pipeline::{
 };
 use warc::WarcHeader;
 use clap::Parser;
+use autometrics::autometrics;
 
 #[derive(Parser, Debug)]
 struct Args {
     /// The version of the crawl to process, e.g., "CC-MAIN-2024-30".
     #[arg(short='v', long, default_value = "CC-MAIN-2024-30")]
     crawl_version: String,
+}
+
+#[autometrics]
+async fn process_batch(batch: Vec<CdxEntry>, args: &Args) {
+    for entry in batch {
+        let data = download_and_unzip(
+            &format!(
+                "https://data.commoncrawl.org/{}/{}",
+                args.crawl_version,
+                entry.metadata.filename
+            ),
+            entry.metadata.offset,
+            entry.metadata.length,
+        )
+        .await
+        .unwrap();
+        for warc_entry in warc::WarcReader::new(data.as_slice()).iter_records() {
+            let warc_entry = warc_entry.unwrap();
+            if warc_entry.header(WarcHeader::WarcType).unwrap() != "response" {
+                continue;
+            }
+            tracing::info!(
+                "Successfully read WARC entry with URL {}",
+                warc_entry.header(WarcHeader::TargetURI).unwrap()
+            );
+            let raw_content = String::from_utf8_lossy(warc_entry.body());
+            let html_begin_index = raw_content.find("\n\n");
+            let Some(html_begin_index) = html_begin_index else {
+                tracing::warn!("Failed to find HTML content in WARC entry");
+                continue;
+            };
+            tracing::debug!(
+                "First 2000 characters of raw content: {}",
+                &raw_content[..2000]
+            );
+            let content = trafilatura::extract(&raw_content[html_begin_index..]).unwrap();
+            if let Some(content) = content {
+                tracing::info!("Extracted content of length {}", content.len());
+                tracing::debug!("Extracted content: {}", &content);
+            } else {
+                tracing::warn!("Failed to extract content from WARC entry");
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -46,47 +91,7 @@ async fn main() {
                     "Received a batch of {} entries",
                     batch.as_ref().unwrap().len()
                 );
-                for entry in batch.unwrap() {
-                    let data = download_and_unzip(
-                        &format!(
-                            "https://data.commoncrawl.org/{}/{}",
-                            args.crawl_version,
-                            entry.metadata.filename
-                        ),
-                        entry.metadata.offset,
-                        entry.metadata.length,
-                    )
-                    .await
-                    .unwrap();
-                    for warc_entry in warc::WarcReader::new(data.as_slice()).iter_records() {
-                        let warc_entry = warc_entry.unwrap();
-                        if warc_entry.header(WarcHeader::WarcType).unwrap() != "response" {
-                            continue;
-                        }
-                        tracing::info!(
-                            "Successfully read WARC entry with URL {}",
-                            warc_entry.header(WarcHeader::TargetURI).unwrap()
-                        );
-                        let raw_content = String::from_utf8_lossy(warc_entry.body());
-                        let html_begin_index = raw_content.find("\n\n");
-                        let Some(html_begin_index) = html_begin_index else {
-                            tracing::warn!("Failed to find HTML content in WARC entry");
-                            continue;
-                        };
-                        tracing::debug!(
-                            "First 2000 characters of raw content: {}",
-                            &raw_content[..2000]
-                        );
-                        let content =
-                            trafilatura::extract(&raw_content[html_begin_index..]).unwrap();
-                        if let Some(content) = content {
-                            tracing::info!("Extracted content of length {}", content.len());
-                            tracing::debug!("Extracted content: {}", &content);
-                        } else {
-                            tracing::warn!("Failed to extract content from WARC entry");
-                        }
-                    }
-                }
+                process_batch(batch.unwrap(), &args).await;
                 delivery.ack(BasicAckOptions::default()).await.unwrap();
             }
             Err(e) => {
