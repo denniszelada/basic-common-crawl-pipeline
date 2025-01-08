@@ -26,13 +26,12 @@
 //!
 //! Once the batcher has downloaded (parts of) an index file, it will filter out URLs that are not in English or that did not return a 200 HTTP status code, batch them into groups whose size has a constant upper limit and push the messages containing these URls into a RabbitMQ queue.
 use clap::Parser;
-use pipeline::commoncrawl::{parse_cdx_line, parse_cluster_idx, ClusterIdxEntry, CdxEntry, download_and_unzip};
-use pipeline::rabbitmq::{rabbitmq_channel_with_queue, rabbitmq_connection, BATCH_SIZE, CC_QUEUE_NAME};
+use pipeline::commoncrawl::{parse_cdx_line, parse_cluster_idx, ClusterIdxEntry, download_and_unzip};
+use pipeline::rabbitmq::{rabbitmq_channel_with_queue, rabbitmq_connection, BATCH_SIZE, CC_QUEUE_NAME, publish_batch};
 use pipeline::tracing_and_metrics::{run_metrics_server, setup_tracing};
 use autometrics::autometrics;
 use std::fs;
 use lapin::Channel;
-use serde_json::to_string;
 use std::path::Path;
 use std::env;
 
@@ -74,7 +73,6 @@ async fn process_cdx_chunk(cdx_chunk: ClusterIdxEntry, args: &Args, channel: &Ch
     .await
     .expect("Failed to download and unzip CDX file");
 
-    // Process the downloaded content
     String::from_utf8_lossy(&cdx_content)
         .lines()
         .filter_map(|line| {
@@ -94,7 +92,7 @@ async fn process_cdx_chunk(cdx_chunk: ClusterIdxEntry, args: &Args, channel: &Ch
                 let channel = channel.clone();
                 let batch = current_batch.clone();
                 tokio::spawn(async move {
-                    publish_batch_local(&channel, CC_QUEUE_NAME, &batch).await;
+                    publish_batch(&channel, CC_QUEUE_NAME, &batch).await;
                 });
                 current_batch.clear();
                 num_batches += 1;
@@ -103,25 +101,11 @@ async fn process_cdx_chunk(cdx_chunk: ClusterIdxEntry, args: &Args, channel: &Ch
 
     // Send any remaining entries in the last batch
     if !current_batch.is_empty() {
-        publish_batch_local(channel, CC_QUEUE_NAME, &current_batch).await;
+        publish_batch(channel, CC_QUEUE_NAME, &current_batch).await;
         num_batches += 1;
     }
 
     num_batches
-}
-
-async fn publish_batch_local(channel: &Channel, queue_name: &str, batch: &[CdxEntry]) {
-    let payload = to_string(batch).expect("Failed to serialize batch");
-    channel
-        .basic_publish(
-            "",
-            queue_name,
-            lapin::options::BasicPublishOptions::default(),
-            payload.as_bytes(),
-            lapin::BasicProperties::default(),
-        )
-        .await
-        .expect("Failed to publish batch");
 }
 
 #[tokio::main]
