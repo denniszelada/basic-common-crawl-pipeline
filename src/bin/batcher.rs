@@ -26,15 +26,15 @@
 //!
 //! Once the batcher has downloaded (parts of) an index file, it will filter out URLs that are not in English or that did not return a 200 HTTP status code, batch them into groups whose size has a constant upper limit and push the messages containing these URls into a RabbitMQ queue.
 use clap::Parser;
-use pipeline::{
-    commoncrawl::{download_and_unzip, parse_cdx_line, parse_cluster_idx, ClusterIdxEntry},
-    rabbitmq::{
-        publish_batch, rabbitmq_channel_with_queue, rabbitmq_connection, BATCH_SIZE, CC_QUEUE_NAME,
-    },
-    tracing_and_metrics::{run_metrics_server, setup_tracing},
-};
-use std::fs;
+use pipeline::commoncrawl::{parse_cdx_line, parse_cluster_idx, ClusterIdxEntry, CdxEntry, download_and_unzip};
+use pipeline::rabbitmq::{rabbitmq_channel_with_queue, rabbitmq_connection, BATCH_SIZE, CC_QUEUE_NAME};
+use pipeline::tracing_and_metrics::{run_metrics_server, setup_tracing};
 use autometrics::autometrics;
+use std::fs;
+use lapin::Channel;
+use serde_json::to_string;
+use std::path::Path;
+use std::env;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -56,41 +56,72 @@ struct Args {
 }
 
 #[autometrics]
-async fn process_cdx_chunk(
-    cdx_chunk: ClusterIdxEntry,
-    args: &Args,
-    channel: &lapin::Channel,
-) -> usize {
-    let english_cdx_entries = String::from_utf8(
-        download_and_unzip(
-            &format!(
-                "https://data.commoncrawl.org/cc-index/collections/{}/indexes/{}",
-                args.crawl_version,
-                cdx_chunk.cdx_filename
-            ),
-            cdx_chunk.cdx_offset,
-            cdx_chunk.cdx_length,
-        )
-        .await
-        .unwrap(),
-    )
-    .unwrap()
-    .lines()
-    .map(parse_cdx_line)
-    .filter(|e| {
-        if let Some(languages) = e.metadata.languages.as_ref() {
-            languages.contains("eng") && e.metadata.status == 200
-        } else {
-            false
-        }
-    })
-    .collect::<Vec<_>>();
+async fn process_cdx_chunk(cdx_chunk: ClusterIdxEntry, args: &Args, channel: &Channel) -> usize {
+    let batch_size = BATCH_SIZE;
+    let mut num_batches = 0;
+    let mut current_batch = Vec::with_capacity(batch_size);
 
-    for batch in english_cdx_entries.as_slice().chunks(BATCH_SIZE) {
-        publish_batch(channel, CC_QUEUE_NAME, batch).await;
+    // Download and unzip the CDX file
+    let cdx_content = download_and_unzip(
+        &format!(
+            "https://data.commoncrawl.org/cc-index/collections/{}/indexes/{}",
+            args.crawl_version,
+            cdx_chunk.cdx_filename
+        ),
+        cdx_chunk.cdx_offset,
+        cdx_chunk.cdx_length,
+    )
+    .await
+    .expect("Failed to download and unzip CDX file");
+
+    // Process the downloaded content
+    String::from_utf8_lossy(&cdx_content)
+        .lines()
+        .filter_map(|line| {
+            let entry = parse_cdx_line(line);
+            Some(entry)
+        })
+        .filter(|e| {
+            if let Some(languages) = e.metadata.languages.as_ref() {
+                languages.contains("eng") && e.metadata.status == 200
+            } else {
+                false
+            }
+        })
+        .for_each(|entry| {
+            current_batch.push(entry);
+            if current_batch.len() == batch_size {
+                let channel = channel.clone();
+                let batch = current_batch.clone();
+                tokio::spawn(async move {
+                    publish_batch_local(&channel, CC_QUEUE_NAME, &batch).await;
+                });
+                current_batch.clear();
+                num_batches += 1;
+            }
+        });
+
+    // Send any remaining entries in the last batch
+    if !current_batch.is_empty() {
+        publish_batch_local(channel, CC_QUEUE_NAME, &current_batch).await;
+        num_batches += 1;
     }
 
-    english_cdx_entries.len()
+    num_batches
+}
+
+async fn publish_batch_local(channel: &Channel, queue_name: &str, batch: &[CdxEntry]) {
+    let payload = to_string(batch).expect("Failed to serialize batch");
+    channel
+        .basic_publish(
+            "",
+            queue_name,
+            lapin::options::BasicPublishOptions::default(),
+            payload.as_bytes(),
+            lapin::BasicProperties::default(),
+        )
+        .await
+        .expect("Failed to publish batch");
 }
 
 #[tokio::main]
@@ -104,10 +135,26 @@ async fn main() {
         .await
         .unwrap();
 
-    let idx = fs::read_to_string(&args.cluster_idx_filename)
+    // Print the current working directory
+    if let Ok(current_dir) = env::current_dir() {
+        println!("Current working directory: {:?}", current_dir);
+    }
+
+    // Print the cluster index filename
+    println!("Cluster index filename: {:?}", args.cluster_idx_filename);
+
+    let cluster_idx_path = Path::new(&args.cluster_idx_filename);
+    println!("Looking for file: {:?}", cluster_idx_path);
+
+    if !cluster_idx_path.exists() {
+        eprintln!("Error: The file '{}' does not exist.", args.cluster_idx_filename);
+        std::process::exit(1);
+    }
+
+    let idx = fs::read_to_string(cluster_idx_path)
         .expect("Should have been able to read the file")
         .lines()
-        .filter_map(parse_cluster_idx)
+        .filter_map(|line| parse_cluster_idx(line))
         .collect::<Vec<_>>();
 
     let mut num_cdx_chunks_processed: usize = 0;
