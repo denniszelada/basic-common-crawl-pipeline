@@ -8,7 +8,7 @@ use tokio::time::{sleep, Duration};
 
 /// Metadata for a crawled URL.
 /// We use this metadata in the batcher to filter URLs before passing them on to the worker(s).
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CdxMetadata {
     pub url: String,
     #[serde(deserialize_with = "deserialize_number_from_string")]
@@ -91,7 +91,7 @@ pub async fn download_and_unzip(
 }
 
 /// Represents a line in a cdx index file.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct CdxEntry {
     pub surt_url: String,
     pub timestamp: String,

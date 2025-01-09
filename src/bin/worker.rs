@@ -25,6 +25,8 @@ use minio::s3::http::BaseUrl;
 use serde_json::json;
 use std::error::Error;
 use std::io::Cursor;
+use dotenv::dotenv;
+use std::env;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -91,12 +93,17 @@ async fn process_batch(batch: Vec<CdxEntry>, args: &Args, client: &Client) {
 
 #[tokio::main]
 async fn main() {
+    dotenv().ok();
     let args = Args::parse();
     setup_tracing();
     tokio::task::spawn(run_metrics_server(9001));
 
-    let base_url = "http://localhost:9000".parse::<BaseUrl>().unwrap();
-    let provider: Option<Box<dyn Provider + Send + Sync>> = Some(Box::new(StaticProvider::new("your-access-key", "your-secret-key", None)));
+    let base_url = env::var("MINIO_BASE_URL").expect("MINIO_BASE_URL must be set");
+    let access_key = env::var("MINIO_ACCESS_KEY").expect("MINIO_ACCESS_KEY must be set");
+    let secret_key = env::var("MINIO_SECRET_KEY").expect("MINIO_SECRET_KEY must be set");
+
+    let base_url = (&base_url).parse::<BaseUrl>().unwrap();
+    let provider: Option<Box<dyn Provider + Send + Sync>> = Some(Box::new(StaticProvider::new(&access_key, &secret_key, None)));
     let client = Client::new(base_url, provider, None, None).unwrap();
 
     let rabbit_conn = rabbitmq_connection().await.unwrap();
