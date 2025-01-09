@@ -18,16 +18,34 @@ use pipeline::{
 use warc::WarcHeader;
 use clap::Parser;
 use autometrics::autometrics;
+use minio::s3::args::PutObjectArgs;
+use minio::s3::client::Client;
+use minio::s3::creds::{StaticProvider, Provider};
+use minio::s3::http::BaseUrl;
+use serde_json::json;
+use std::error::Error;
+use std::io::Cursor;
 
 #[derive(Parser, Debug)]
 struct Args {
     /// The version of the crawl to process, e.g., "CC-MAIN-2024-30".
     #[arg(short='v', long, default_value = "CC-MAIN-2024-30")]
     crawl_version: String,
+
+    /// The name of the MinIO bucket.
+    #[arg(long)]
+    minio_bucket: String,
+}
+
+async fn upload_to_minio(client: &Client, bucket: &str, key: &str, content: &str) -> Result<(), Box<dyn Error>> {
+    let mut reader = Cursor::new(content.as_bytes());
+    let mut args = PutObjectArgs::new(bucket, key, &mut reader, Some(content.len()), Some("application/json".len()))?;
+    client.put_object(&mut args).await?;
+    Ok(())
 }
 
 #[autometrics]
-async fn process_batch(batch: Vec<CdxEntry>, args: &Args) {
+async fn process_batch(batch: Vec<CdxEntry>, args: &Args, client: &Client) {
     for entry in batch {
         let data = download_and_unzip(
             &format!(
@@ -55,14 +73,15 @@ async fn process_batch(batch: Vec<CdxEntry>, args: &Args) {
                 tracing::warn!("Failed to find HTML content in WARC entry");
                 continue;
             };
-            tracing::debug!(
-                "First 2000 characters of raw content: {}",
-                &raw_content[..2000]
-            );
             let content = trafilatura::extract(&raw_content[html_begin_index..]).unwrap();
             if let Some(content) = content {
-                tracing::info!("Extracted content of length {}", content.len());
-                tracing::debug!("Extracted content: {}", &content);
+                let json_content = json!({
+                    "url": entry.metadata.url,
+                    "content": content
+                });
+                let key = format!("{}.json", entry.metadata.url.replace("/", "_"));
+                upload_to_minio(client, &args.minio_bucket, &key, &json_content.to_string()).await.unwrap();
+                tracing::info!("Uploaded content to MinIO with key {}", key);
             } else {
                 tracing::warn!("Failed to extract content from WARC entry");
             }
@@ -75,6 +94,10 @@ async fn main() {
     let args = Args::parse();
     setup_tracing();
     tokio::task::spawn(run_metrics_server(9001));
+
+    let base_url = "http://localhost:9000".parse::<BaseUrl>().unwrap();
+    let provider: Option<Box<dyn Provider + Send + Sync>> = Some(Box::new(StaticProvider::new("your-access-key", "your-secret-key", None)));
+    let client = Client::new(base_url, provider, None, None).unwrap();
 
     let rabbit_conn = rabbitmq_connection().await.unwrap();
     let (channel, _queue) = rabbitmq_channel_with_queue(&rabbit_conn, CC_QUEUE_NAME)
@@ -91,7 +114,7 @@ async fn main() {
                     "Received a batch of {} entries",
                     batch.as_ref().unwrap().len()
                 );
-                process_batch(batch.unwrap(), &args).await;
+                process_batch(batch.unwrap(), &args, &client).await;
                 delivery.ack(BasicAckOptions::default()).await.unwrap();
             }
             Err(e) => {
