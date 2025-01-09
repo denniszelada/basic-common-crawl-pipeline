@@ -27,13 +27,14 @@
 //! Once the batcher has downloaded (parts of) an index file, it will filter out URLs that are not in English or that did not return a 200 HTTP status code, batch them into groups whose size has a constant upper limit and push the messages containing these URls into a RabbitMQ queue.
 use clap::Parser;
 use pipeline::{
-    commoncrawl::{download_and_unzip, parse_cdx_line, parse_cluster_idx},
+    commoncrawl::{download_and_unzip, parse_cdx_line, parse_cluster_idx, ClusterIdxEntry},
     rabbitmq::{
         publish_batch, rabbitmq_channel_with_queue, rabbitmq_connection, BATCH_SIZE, CC_QUEUE_NAME,
     },
     tracing_and_metrics::{run_metrics_server, setup_tracing},
 };
 use std::fs;
+use autometrics::autometrics;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -54,6 +55,44 @@ struct Args {
     crawl_version: String,
 }
 
+#[autometrics]
+async fn process_cdx_chunk(
+    cdx_chunk: ClusterIdxEntry,
+    args: &Args,
+    channel: &lapin::Channel,
+) -> usize {
+    let english_cdx_entries = String::from_utf8(
+        download_and_unzip(
+            &format!(
+                "https://data.commoncrawl.org/cc-index/collections/{}/indexes/{}",
+                args.crawl_version,
+                cdx_chunk.cdx_filename
+            ),
+            cdx_chunk.cdx_offset,
+            cdx_chunk.cdx_length,
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap()
+    .lines()
+    .map(parse_cdx_line)
+    .filter(|e| {
+        if let Some(languages) = e.metadata.languages.as_ref() {
+            languages.contains("eng") && e.metadata.status == 200
+        } else {
+            false
+        }
+    })
+    .collect::<Vec<_>>();
+
+    for batch in english_cdx_entries.as_slice().chunks(BATCH_SIZE) {
+        publish_batch(channel, CC_QUEUE_NAME, batch).await;
+    }
+
+    english_cdx_entries.len()
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -65,7 +104,7 @@ async fn main() {
         .await
         .unwrap();
 
-    let idx = fs::read_to_string(args.cluster_idx_filename)
+    let idx = fs::read_to_string(&args.cluster_idx_filename)
         .expect("Should have been able to read the file")
         .lines()
         .filter_map(parse_cluster_idx)
@@ -74,35 +113,7 @@ async fn main() {
     let mut num_cdx_chunks_processed: usize = 0;
     for cdx_chunk in idx {
         print!(".");
-        let english_cdx_entries = String::from_utf8(
-            download_and_unzip(
-                &format!(
-                    "https://data.commoncrawl.org/cc-index/collections/{}/indexes/{}",
-                    args.crawl_version,
-                    cdx_chunk.cdx_filename
-                ),
-                cdx_chunk.cdx_offset,
-                cdx_chunk.cdx_length,
-            )
-            .await
-            .unwrap(),
-        )
-        .unwrap()
-        .lines()
-        .map(parse_cdx_line)
-        .filter(|e| {
-            if let Some(languages) = e.metadata.languages.as_ref() {
-                languages.contains("eng") && e.metadata.status == 200
-            } else {
-                false
-            }
-        })
-        .collect::<Vec<_>>();
-
-        for batch in english_cdx_entries.as_slice().chunks(BATCH_SIZE) {
-            publish_batch(&channel, CC_QUEUE_NAME, batch).await;
-        }
-        num_cdx_chunks_processed += 1;
+        num_cdx_chunks_processed += process_cdx_chunk(cdx_chunk, &args, &channel).await;
         if let Some(to_process) = args.num_cdx_chunks_to_process {
             if to_process == num_cdx_chunks_processed {
                 break;
