@@ -3,3 +3,4 @@ pika
 prometheus-client
 requests
 warcio
+security==1.3.1

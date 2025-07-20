@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 import csv
 import gzip
 from typing import Generator, List, Optional
-import requests
+from security import safe_requests
 
 
 CRAWL_PATH = "cc-index/collections/CC-MAIN-2024-30/indexes"
@@ -21,7 +21,7 @@ class CCDownloader(Downloader):
 
     def download_and_unzip(self, url: str, start: int, length: int) -> bytes:
         headers = {"Range": f"bytes={start}-{start+length-1}"}
-        response = requests.get(f"{self.base_url}/{url}", headers=headers)
+        response = safe_requests.get(f"{self.base_url}/{url}", headers=headers)
         response.raise_for_status()
         buffer = response.content
         return gzip.decompress(buffer)
